@@ -1,0 +1,33 @@
+{
+  "name": "kickwise-engine",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Prediction engine for Kickwise. Builds Poisson match predictions, player projections, and the 3-2-1 manager H2H scores. Phase-1 skeleton only.",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch --env-file=.env.local src/index.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "lint": "biome check --write .",
+    "lint:check": "biome check .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "biome check --write .",
+    "check:ci": "biome check .",
+    "security:audit": "npm audit --audit-level=high"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0",
+    "pino-pretty": "^11.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "@vitest/coverage-v8": "^2.0.0",
+    "vitest": "^2.0.0"
+  }
+}
