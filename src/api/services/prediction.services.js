@@ -4,26 +4,32 @@ import { matchOutcomeProbabilities } from "../../utils/poisson.utils.js";
 export const MODEL_VERSION = "poisson-xg-v2";
 
 // All tunable knobs in one place. Backtest can override them so we can
-// sweep different settings without re-deploying. Defaults reflect what
-// looked sensible after the v1 backtest on 2024/2025: draws underestimated,
-// home advantage roughly on target, finishing-luck noticeable enough to
-// blend xG with actual goals.
+// sweep different settings without re-deploying. Defaults are calibrated
+// against the 2024/2025 Bundesliga backtest:
+//
+//   v1-baseline (decay=0, rho=0, blend=1) ........ logLoss 1.0559
+//   v2-defaults (decay=0.15, rho=0.10, blend=0.7) . logLoss 1.0596
+//   v2-tuned   (decay=0,    rho=0.10, blend=1)  ... logLoss 1.0547 ← chosen
+//
+// Form-decay and the xG/goals blend did not move the needle on 2024/2025 —
+// the only improvement that survived the sweep was the Dixon-Coles draw
+// correction. The other two tunables stay in the code so we can revisit
+// them later (e.g. once we have more seasons of xG data and the form-decay
+// can actually distinguish coaching changes / mid-season collapses).
 export const DEFAULT_PARAMS = Object.freeze({
   // Sliding window of recent matches per team.
   formWindow: 10,
 
-  // exp(-decayRate * gamesAgo) weighting inside the form window. 0 reproduces
-  // the v1 equal-weights mean; 0.15 gives the most recent match ~2.5× the
-  // weight of the oldest of 10.
-  decayRate: 0.15,
+  // exp(-decayRate * gamesAgo) weighting. 0 reproduces equal-weights mean,
+  // which is what the 2024/2025 backtest actually preferred.
+  decayRate: 0,
 
   // Dixon-Coles draw boost. Positive values push probability into the
-  // (0,0), (1,0), (0,1), (1,1) cells. 0.10 is a moderate top-flight value.
+  // (0,0), (1,0), (0,1), (1,1) cells. 0.10 was the empirical sweet spot.
   rho: 0.1,
 
-  // Convex blend xG-strength : actual-goals-strength. 0.7 = 70% xG signal
-  // (chance quality) + 30% actual goals (finishing efficiency / luck).
-  xgGoalsBlend: 0.7,
+  // Convex blend xG-strength : actual-goals-strength. 1.0 = pure xG.
+  xgGoalsBlend: 1.0,
 
   // Empirical home factor on goals scored. Applied as ×factor to home λ
   // and /factor to away λ.
