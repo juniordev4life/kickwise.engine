@@ -1,35 +1,21 @@
-import Fastify from "fastify";
+import { buildServer } from "./server.js";
 
 const port = Number.parseInt(process.env.PORT ?? "3002", 10);
+const host = process.env.HOST ?? "0.0.0.0";
 
-const server = Fastify({
-  logger: {
-    level: process.env.LOG_LEVEL ?? "info",
-    transport:
-      process.env.NODE_ENV === "production"
-        ? undefined
-        : {
-            target: "pino-pretty",
-            options: { colorize: true, translateTime: "SYS:standard" }
-          }
-  }
-});
-
-server.get("/health", async () => ({
-  service: "engine",
-  status: "ok",
-  phase: "1 — skeleton",
-  timestamp: new Date().toISOString()
-}));
-
-server.get("/", async () => ({
-  message:
-    "Kickwise Engine — Phase 2 coming soon (Poisson predictions, player projections, 3-2-1 manager H2H)"
-}));
+const server = await buildServer();
 
 try {
-  await server.listen({ port, host: "0.0.0.0" });
-} catch (err) {
-  server.log.error({ err }, "Engine failed to start");
+  await server.listen({ port, host });
+} catch (error) {
+  server.log.error({ err: error }, "Engine failed to start");
   process.exit(1);
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, async () => {
+    server.log.info({ signal }, "Engine shutting down");
+    await server.close();
+    process.exit(0);
+  });
 }

@@ -1,7 +1,4 @@
-name: Match Day (build & push only)
-
-# Phase 1: build + push image to Artifact Registry so it exists when the
-# Engine Cloud Run service gets provisioned in Phase 2. No deploy yet.
+name: Match Day (deploy)
 
 on:
   push:
@@ -18,17 +15,19 @@ env:
   GCP_REGION: europe-west3
   ARTIFACT_REGISTRY: europe-west3-docker.pkg.dev/kickwise-prod/kickwise
   IMAGE_NAME: engine
+  SERVICE_NAME: kickwise-euw3-run-engine
   WIF_PROVIDER: projects/264607219534/locations/global/workloadIdentityPools/kickwise-euw3-pool-github/providers/kickwise-euw3-prov-github
   DEPLOY_SA: kickwise-euw3-sa-gha-deploy@kickwise-prod.iam.gserviceaccount.com
 
 jobs:
-  warmup-and-push:
-    name: Warmup & Push
+  warmup-and-deploy:
+    name: Warmup, Push & Match Day
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
@@ -37,15 +36,16 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
 
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
       - name: Compute image tag
         id: tag
         run: |
           SHORT_SHA="${GITHUB_SHA::7}"
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "fqin=${ARTIFACT_REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
           echo "fqin_latest=${ARTIFACT_REGISTRY}/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
-
-      - name: Configure Docker for Artifact Registry
-        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
 
       - name: Build container image
         run: |
@@ -58,3 +58,19 @@ jobs:
         run: |
           docker push "${{ steps.tag.outputs.fqin }}"
           docker push "${{ steps.tag.outputs.fqin_latest }}"
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy "${SERVICE_NAME}" \
+            --project="${GCP_PROJECT}" \
+            --region="${GCP_REGION}" \
+            --image="${{ steps.tag.outputs.fqin }}" \
+            --quiet
+
+      - name: Show service URL
+        run: |
+          URL=$(gcloud run services describe "${SERVICE_NAME}" \
+            --project="${GCP_PROJECT}" \
+            --region="${GCP_REGION}" \
+            --format='value(status.url)')
+          echo "Engine is live at: ${URL}"
