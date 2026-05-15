@@ -20,19 +20,27 @@ export function poissonPmf(k, lambda) {
 
 /**
  * Outcome distribution (home win / draw / away win) and expected goals from
- * a pair of independent Poisson means.
+ * a pair of independent Poisson means. Supports the Dixon-Coles
+ * low-score correction: with rho > 0 the four cells (0,0), (1,0), (0,1),
+ * (1,1) get a multiplicative adjustment that boosts draws (and damps the
+ * 0-0 / 1-1 / 1-0 / 0-1 underestimation classic Poisson models exhibit).
  *
  * @param {number} expectedHomeGoals λ for home side
  * @param {number} expectedAwayGoals λ for away side
- * @param {number} [maxGoals=8] Truncation cap for the score matrix
+ * @param {object} [opts]
+ * @param {number} [opts.maxGoals=8] Truncation cap for the score matrix
+ * @param {number} [opts.rho=0] Dixon-Coles draw-correlation parameter. 0
+ *   reproduces independent Poisson; 0.05–0.15 is the typical empirical
+ *   range for top-flight European football.
  * @returns {{ probHomeWin: number, probDraw: number, probAwayWin: number,
  *   expectedHomeGoals: number, expectedAwayGoals: number }}
  *
  * @example
- *   matchOutcomeProbabilities(1.6, 1.1)
- *   // { probHomeWin: ~0.49, probDraw: ~0.26, probAwayWin: ~0.25, ... }
+ *   matchOutcomeProbabilities(1.6, 1.1, { rho: 0.1 })
+ *   // probDraw bumps a few percent vs the rho=0 baseline
  */
-export function matchOutcomeProbabilities(expectedHomeGoals, expectedAwayGoals, maxGoals = 8) {
+export function matchOutcomeProbabilities(expectedHomeGoals, expectedAwayGoals, opts = {}) {
+  const { maxGoals = 8, rho = 0 } = opts;
   let pHome = 0;
   let pDraw = 0;
   let pAway = 0;
@@ -40,7 +48,8 @@ export function matchOutcomeProbabilities(expectedHomeGoals, expectedAwayGoals, 
     const ph = poissonPmf(h, expectedHomeGoals);
     for (let a = 0; a <= maxGoals; a += 1) {
       const pa = poissonPmf(a, expectedAwayGoals);
-      const joint = ph * pa;
+      const tau = dixonColesTau(h, a, expectedHomeGoals, expectedAwayGoals, rho);
+      const joint = ph * pa * tau;
       if (h > a) pHome += joint;
       else if (h === a) pDraw += joint;
       else pAway += joint;
@@ -54,6 +63,31 @@ export function matchOutcomeProbabilities(expectedHomeGoals, expectedAwayGoals, 
     expectedHomeGoals,
     expectedAwayGoals
   };
+}
+
+/**
+ * Dixon-Coles τ-factor applied to the four low-score cells. Returns 1 for
+ * every other (h, a) pair so the rest of the score matrix is unchanged.
+ *
+ * @param {number} h home goals
+ * @param {number} a away goals
+ * @param {number} lambdaH home λ
+ * @param {number} lambdaA away λ
+ * @param {number} rho correlation parameter
+ * @returns {number}
+ */
+function dixonColesTau(h, a, lambdaH, lambdaA, rho) {
+  if (!rho) return 1;
+  // Sign convention chosen so positive rho boosts draws (matching the
+  // empirical Bundesliga / Premier League observation that classic Poisson
+  // undercounts 0-0 and 1-1). Original Dixon-Coles 1997 paper uses the
+  // opposite sign convention, where their reported rho is typically
+  // negative; this implementation flips that for readability.
+  if (h === 0 && a === 0) return 1 + lambdaH * lambdaA * rho;
+  if (h === 0 && a === 1) return 1 - lambdaH * rho;
+  if (h === 1 && a === 0) return 1 - lambdaA * rho;
+  if (h === 1 && a === 1) return 1 + rho;
+  return 1;
 }
 
 const LOG_FACT_CACHE = [0];

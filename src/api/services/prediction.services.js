@@ -1,41 +1,55 @@
 import { bqTable, getBigQueryClient } from "../../config/bigQuery.config.js";
 import { matchOutcomeProbabilities } from "../../utils/poisson.utils.js";
 
-export const MODEL_VERSION = "poisson-xg-v1";
+export const MODEL_VERSION = "poisson-xg-v2";
 
-// Sliding window of completed matches used to estimate each team's attacking
-// and defensive strength. 10 is a common Premier League / Bundesliga choice —
-// long enough to dampen noise from one outlier, short enough to track form
-// (manager change, injury wave, ...).
-const FORM_WINDOW = 10;
+// All tunable knobs in one place. Backtest can override them so we can
+// sweep different settings without re-deploying. Defaults reflect what
+// looked sensible after the v1 backtest on 2024/2025: draws underestimated,
+// home advantage roughly on target, finishing-luck noticeable enough to
+// blend xG with actual goals.
+export const DEFAULT_PARAMS = Object.freeze({
+  // Sliding window of recent matches per team.
+  formWindow: 10,
 
-// Home advantage as a multiplier on the home side's expected goals. Empirical
-// Bundesliga home factor is ~1.20 on goals scored. We apply it symmetrically:
-// home attack × HOME_FACTOR_ATT, away attack × (1 / HOME_FACTOR_ATT). Net
-// effect on expected goals is the classic ~10% bump per side.
-const HOME_ATTACK_FACTOR = 1.1;
-const HOME_DEFENSE_FACTOR = 1 / HOME_ATTACK_FACTOR;
+  // exp(-decayRate * gamesAgo) weighting inside the form window. 0 reproduces
+  // the v1 equal-weights mean; 0.15 gives the most recent match ~2.5× the
+  // weight of the oldest of 10.
+  decayRate: 0.15,
 
-// Hard floor for any expected-goals estimate. Without it a brand-new team
-// with zero recorded matches in the window would yield λ=0 → Poisson(0) → all
-// mass at 0 goals, which collapses the prediction to draw=100%.
-const MIN_LAMBDA = 0.3;
+  // Dixon-Coles draw boost. Positive values push probability into the
+  // (0,0), (1,0), (0,1), (1,1) cells. 0.10 is a moderate top-flight value.
+  rho: 0.1,
+
+  // Convex blend xG-strength : actual-goals-strength. 0.7 = 70% xG signal
+  // (chance quality) + 30% actual goals (finishing efficiency / luck).
+  xgGoalsBlend: 0.7,
+
+  // Empirical home factor on goals scored. Applied as ×factor to home λ
+  // and /factor to away λ.
+  homeAttackFactor: 1.1,
+
+  // Hard floor to avoid λ=0 collapsing the prediction to draw=100%.
+  minLambda: 0.3
+});
 
 /**
- * Compute a Poisson-xG match prediction for a fixture. Pulls each team's
- * rolling xG-for / xG-against averages from BigQuery, blends them with the
- * league-wide attack/defense baseline, applies a home-advantage multiplier
- * and turns the resulting (λ_home, λ_away) into outcome probabilities.
+ * Compute a Poisson-xG match prediction for a fixture. v2 model:
+ *   - blends xG-based and actual-goals-based strength ratios
+ *   - applies exponential form-decay so recent results matter more
+ *   - applies the Dixon-Coles correction to boost draws
  *
  * @param {object} args
  * @param {string} args.matchId openligadb match id
+ * @param {object} [args.paramOverrides] override any of DEFAULT_PARAMS
  * @returns {Promise<object>} Prediction envelope including features
  *
  * @example
  *   const p = await computePrediction({ matchId: "12345" });
- *   p.probHomeWin // 0.51
+ *   p.probDraw // ~0.25 (v2 reports more draws than v1)
  */
-export async function computePrediction({ matchId }) {
+export async function computePrediction({ matchId, paramOverrides }) {
+  const params = { ...DEFAULT_PARAMS, ...(paramOverrides ?? {}) };
   const fixture = await loadFixture(matchId);
   if (!fixture) {
     const err = new Error(`Match ${matchId} not found`);
@@ -45,25 +59,37 @@ export async function computePrediction({ matchId }) {
   const seasonId = fixture.season_id;
   const baseline = await loadSeasonBaseline(seasonId);
   const [homeForm, awayForm] = await Promise.all([
-    loadTeamForm({ teamId: fixture.home_team_id, beforeDate: fixture.kickoff_at }),
-    loadTeamForm({ teamId: fixture.away_team_id, beforeDate: fixture.kickoff_at })
+    loadTeamForm({
+      teamId: fixture.home_team_id,
+      beforeDate: fixture.kickoff_at,
+      windowSize: params.formWindow,
+      decayRate: params.decayRate
+    }),
+    loadTeamForm({
+      teamId: fixture.away_team_id,
+      beforeDate: fixture.kickoff_at,
+      windowSize: params.formWindow,
+      decayRate: params.decayRate
+    })
   ]);
 
-  const homeAttack = strengthRatio(homeForm.xgPerMatch, baseline.avgGoalsForPerMatch);
-  const homeDefense = strengthRatio(homeForm.xgaPerMatch, baseline.avgGoalsForPerMatch);
-  const awayAttack = strengthRatio(awayForm.xgPerMatch, baseline.avgGoalsForPerMatch);
-  const awayDefense = strengthRatio(awayForm.xgaPerMatch, baseline.avgGoalsForPerMatch);
+  const homeStrengths = computeBlendedStrengths(homeForm, baseline, params.xgGoalsBlend);
+  const awayStrengths = computeBlendedStrengths(awayForm, baseline, params.xgGoalsBlend);
 
+  const homeDefenseFactor = 1 / params.homeAttackFactor;
   const lambdaHome = Math.max(
-    MIN_LAMBDA,
-    baseline.avgGoalsForPerMatch * homeAttack * awayDefense * HOME_ATTACK_FACTOR
+    params.minLambda,
+    baseline.avgGoalsForPerMatch *
+      homeStrengths.attack *
+      awayStrengths.defense *
+      params.homeAttackFactor
   );
   const lambdaAway = Math.max(
-    MIN_LAMBDA,
-    baseline.avgGoalsForPerMatch * awayAttack * homeDefense * HOME_DEFENSE_FACTOR
+    params.minLambda,
+    baseline.avgGoalsForPerMatch * awayStrengths.attack * homeStrengths.defense * homeDefenseFactor
   );
 
-  const outcome = matchOutcomeProbabilities(lambdaHome, lambdaAway);
+  const outcome = matchOutcomeProbabilities(lambdaHome, lambdaAway, { rho: params.rho });
 
   return {
     matchId,
@@ -76,25 +102,28 @@ export async function computePrediction({ matchId }) {
     expectedAwayGoals: outcome.expectedAwayGoals,
     features: {
       seasonId,
-      formWindow: FORM_WINDOW,
+      params,
       baseline,
       home: {
         teamId: fixture.home_team_id,
         matchesInWindow: homeForm.matchesUsed,
         xgPerMatch: homeForm.xgPerMatch,
         xgaPerMatch: homeForm.xgaPerMatch,
-        attackStrength: homeAttack,
-        defenseStrength: homeDefense
+        goalsForPerMatch: homeForm.goalsForPerMatch,
+        goalsAgainstPerMatch: homeForm.goalsAgainstPerMatch,
+        attackStrength: homeStrengths.attack,
+        defenseStrength: homeStrengths.defense
       },
       away: {
         teamId: fixture.away_team_id,
         matchesInWindow: awayForm.matchesUsed,
         xgPerMatch: awayForm.xgPerMatch,
         xgaPerMatch: awayForm.xgaPerMatch,
-        attackStrength: awayAttack,
-        defenseStrength: awayDefense
-      },
-      homeAdvantage: { attack: HOME_ATTACK_FACTOR, defense: HOME_DEFENSE_FACTOR }
+        goalsForPerMatch: awayForm.goalsForPerMatch,
+        goalsAgainstPerMatch: awayForm.goalsAgainstPerMatch,
+        attackStrength: awayStrengths.attack,
+        defenseStrength: awayStrengths.defense
+      }
     }
   };
 }
@@ -118,48 +147,98 @@ async function loadSeasonBaseline(seasonId) {
   const [rows] = await bq.query({
     query: `
       SELECT
-        AVG(xg) AS avg_xg_per_team_per_match,
-        COUNT(*) AS sample_size
-      FROM \`${bqTable("xg_match_data")}\`
-      WHERE season_id = @seasonId
+        (SELECT AVG(xg) FROM \`${bqTable("xg_match_data")}\` WHERE season_id = @seasonId) AS avg_xg,
+        (
+          SELECT AVG(score) FROM (
+            SELECT home_score AS score FROM \`${bqTable("matches")}\`
+              WHERE season_id = @seasonId AND status = 'finished' AND home_score IS NOT NULL
+            UNION ALL
+            SELECT away_score AS score FROM \`${bqTable("matches")}\`
+              WHERE season_id = @seasonId AND status = 'finished' AND away_score IS NOT NULL
+          )
+        ) AS avg_goals
     `,
     params: { seasonId }
   });
-  const avg = Number(rows[0]?.avg_xg_per_team_per_match);
-  // Fallback to the long-running Bundesliga average if we somehow have no
-  // sample (early in a new season, before any matches have been played).
-  const safe = Number.isFinite(avg) && avg > 0 ? avg : 1.45;
+  const avgXg = Number(rows[0]?.avg_xg);
+  const avgGoals = Number(rows[0]?.avg_goals);
+  // Long-running Bundesliga averages as a safe fallback (early season,
+  // historic backtests of partially-loaded seasons, ...).
+  const safeXg = Number.isFinite(avgXg) && avgXg > 0 ? avgXg : 1.45;
+  const safeGoals = Number.isFinite(avgGoals) && avgGoals > 0 ? avgGoals : 1.5;
   return {
-    avgGoalsForPerMatch: safe,
-    sampleSize: Number(rows[0]?.sample_size ?? 0)
+    avgGoalsForPerMatch: safeXg,
+    avgXgPerMatch: safeXg,
+    avgActualGoalsPerMatch: safeGoals
   };
 }
 
-async function loadTeamForm({ teamId, beforeDate }) {
+async function loadTeamForm({ teamId, beforeDate, windowSize, decayRate }) {
   const bq = getBigQueryClient();
   const [rows] = await bq.query({
     query: `
-      SELECT x.xg, x.xga
+      SELECT
+        x.xg, x.xga,
+        CASE WHEN x.is_home THEN m.home_score ELSE m.away_score END AS goals_for,
+        CASE WHEN x.is_home THEN m.away_score ELSE m.home_score END AS goals_against
       FROM \`${bqTable("xg_match_data")}\` x
       JOIN \`${bqTable("matches")}\` m ON m.match_id = x.match_id
       WHERE x.team_id = @teamId
         AND m.kickoff_at < @beforeDate
         AND x.xg IS NOT NULL
+        AND m.home_score IS NOT NULL
+        AND m.away_score IS NOT NULL
       ORDER BY m.kickoff_at DESC
       LIMIT @windowSize
     `,
-    params: { teamId, beforeDate, windowSize: FORM_WINDOW },
+    params: { teamId, beforeDate, windowSize },
     types: { teamId: "STRING", beforeDate: "TIMESTAMP", windowSize: "INT64" }
   });
+  return aggregateForm(rows, decayRate);
+}
+
+function aggregateForm(rows, decayRate) {
   if (rows.length === 0) {
-    return { xgPerMatch: null, xgaPerMatch: null, matchesUsed: 0 };
+    return {
+      xgPerMatch: null,
+      xgaPerMatch: null,
+      goalsForPerMatch: null,
+      goalsAgainstPerMatch: null,
+      matchesUsed: 0
+    };
   }
-  const xgSum = rows.reduce((s, r) => s + Number(r.xg ?? 0), 0);
-  const xgaSum = rows.reduce((s, r) => s + Number(r.xga ?? 0), 0);
+  let weightSum = 0;
+  let xgWeighted = 0;
+  let xgaWeighted = 0;
+  let goalsForWeighted = 0;
+  let goalsAgainstWeighted = 0;
+  rows.forEach((r, idx) => {
+    // idx 0 = most recent (rows are sorted DESC by kickoff)
+    const w = decayRate > 0 ? Math.exp(-decayRate * idx) : 1;
+    weightSum += w;
+    xgWeighted += w * Number(r.xg ?? 0);
+    xgaWeighted += w * Number(r.xga ?? 0);
+    goalsForWeighted += w * Number(r.goals_for ?? 0);
+    goalsAgainstWeighted += w * Number(r.goals_against ?? 0);
+  });
   return {
-    xgPerMatch: xgSum / rows.length,
-    xgaPerMatch: xgaSum / rows.length,
+    xgPerMatch: xgWeighted / weightSum,
+    xgaPerMatch: xgaWeighted / weightSum,
+    goalsForPerMatch: goalsForWeighted / weightSum,
+    goalsAgainstPerMatch: goalsAgainstWeighted / weightSum,
     matchesUsed: rows.length
+  };
+}
+
+function computeBlendedStrengths(form, baseline, xgWeight) {
+  const xgAttack = strengthRatio(form.xgPerMatch, baseline.avgXgPerMatch);
+  const xgDefense = strengthRatio(form.xgaPerMatch, baseline.avgXgPerMatch);
+  const goalAttack = strengthRatio(form.goalsForPerMatch, baseline.avgActualGoalsPerMatch);
+  const goalDefense = strengthRatio(form.goalsAgainstPerMatch, baseline.avgActualGoalsPerMatch);
+  const w = clamp01(xgWeight);
+  return {
+    attack: w * xgAttack + (1 - w) * goalAttack,
+    defense: w * xgDefense + (1 - w) * goalDefense
   };
 }
 
@@ -169,21 +248,13 @@ function strengthRatio(teamValue, leagueAverage) {
   return teamValue / leagueAverage;
 }
 
-/**
- * Compute predictions for every match of a given matchday and MERGE the
- * results into the `predictions` BigQuery table. Idempotent on the
- * (match_id, model_version, run_at) key — a re-run with the same run_at
- * would overwrite, but every wall-clock-different run keeps history.
- *
- * @param {object} args
- * @param {string} args.seasonId e.g. "2025/2026"
- * @param {number} args.matchday e.g. 34
- * @param {import("fastify").FastifyBaseLogger} [args.log]
- * @returns {Promise<{matchday: number, seasonId: string, predictionsWritten: number, failures: number}>}
- *
- * @example
- *   await computeAndCacheMatchdayPredictions({ seasonId: "2025/2026", matchday: 34 });
- */
+function clamp01(v) {
+  if (!Number.isFinite(v)) return 0.5;
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
 /**
  * Find the matchday Kickwise should currently predict for: the smallest
  * matchday in the current season that still has at least one match not yet
@@ -209,6 +280,11 @@ export async function findUpcomingMatchday() {
   return { seasonId: rows[0].season_id, matchday: Number(rows[0].matchday) };
 }
 
+/**
+ * Compute predictions for every match of a given matchday and append the
+ * results to the `predictions` BigQuery table. Each run gets a new run_at
+ * so previous snapshots stay in the archive for backtesting.
+ */
 export async function computeAndCacheMatchdayPredictions({ seasonId, matchday, log }) {
   const matchIds = await loadMatchIdsForMatchday(seasonId, matchday);
   const predictions = [];
@@ -222,7 +298,7 @@ export async function computeAndCacheMatchdayPredictions({ seasonId, matchday, l
     }
   }
   if (predictions.length > 0) {
-    await mergePredictionsToBigQuery(predictions);
+    await insertPredictionsToBigQuery(predictions);
   }
   return {
     seasonId,
@@ -247,9 +323,8 @@ async function loadMatchIdsForMatchday(seasonId, matchday) {
   return rows.map((r) => r.match_id);
 }
 
-async function mergePredictionsToBigQuery(predictions) {
+async function insertPredictionsToBigQuery(predictions) {
   const bq = getBigQueryClient();
-  const fqn = bqTable("predictions");
   const stagingRows = predictions.map((p) => ({
     match_id: p.matchId,
     model_version: p.modelVersion,
@@ -261,39 +336,29 @@ async function mergePredictionsToBigQuery(predictions) {
     expected_away_goals: p.expectedAwayGoals,
     features: JSON.stringify(p.features ?? {})
   }));
-
-  // Insert directly via streaming. predictions is partitioned by run_at and
-  // we treat each batch run as a new archived snapshot — there's no need for
-  // a true MERGE here (duplicates within the same wall-clock second are
-  // accepted by the schema, downstream consumers pick MAX(run_at) anyway).
   await bq
     .dataset(process.env.BQ_DATASET ?? "kickwise_main")
     .table("predictions")
-    .insert(stagingRows, { schema: fqn, ignoreUnknownValues: false });
+    .insert(stagingRows, { ignoreUnknownValues: false });
 }
 
 /**
- * Backtest the current model against historical finished matches in a
- * season. Pulls all relevant data up front (matches + every xg_match_data
- * row pre-season-start) and replays each fixture in memory, so even a full
- * 306-game season runs in seconds instead of minutes.
- *
- * Strict in the form-window: only xg_match_data rows whose kickoff_at is
- * before the fixture being scored are considered (no leakage). The season
- * baseline is the long-running league average — close enough at v1 scale;
- * a stricter "baseline as-of kickoff" would shift it by <0.05 xG and is
- * planned for a v2 backtest.
+ * Backtest a model variant against historical finished matches in a season.
+ * Loads matches + every xG row up front and replays each fixture in memory
+ * (no per-match BigQuery roundtrips), so a 306-game season finishes in a
+ * few seconds.
  *
  * @param {object} args
  * @param {string} args.seasonId
+ * @param {object} [args.paramOverrides] override any of DEFAULT_PARAMS
  * @param {import("fastify").FastifyBaseLogger} [args.log]
- * @returns {Promise<object>} aggregate Log-Loss + Brier + accuracy + per-outcome breakdown
+ * @returns {Promise<object>} aggregate Log-Loss + Brier + accuracy
  *
  * @example
- *   const report = await backtest({ seasonId: "2024/2025" });
- *   report.logLoss // ~0.95
+ *   await backtest({ seasonId: "2024/2025", paramOverrides: { rho: 0.05 } });
  */
-export async function backtest({ seasonId, log }) {
+export async function backtest({ seasonId, paramOverrides, log }) {
+  const params = { ...DEFAULT_PARAMS, ...(paramOverrides ?? {}) };
   const bq = getBigQueryClient();
 
   const [matchesRows, xgRows, baselineRows] = await Promise.all([
@@ -312,18 +377,27 @@ export async function backtest({ seasonId, log }) {
     }),
     bq.query({
       query: `
-        SELECT x.team_id, x.xg, x.xga, m.kickoff_at
+        SELECT
+          x.team_id, x.xg, x.xga, x.is_home, m.kickoff_at, m.home_score, m.away_score
         FROM \`${bqTable("xg_match_data")}\` x
         JOIN \`${bqTable("matches")}\` m ON m.match_id = x.match_id
-        WHERE x.xg IS NOT NULL
+        WHERE x.xg IS NOT NULL AND m.home_score IS NOT NULL
         ORDER BY m.kickoff_at
       `
     }),
     bq.query({
       query: `
-        SELECT AVG(xg) AS avg_xg
-        FROM \`${bqTable("xg_match_data")}\`
-        WHERE season_id = @seasonId
+        SELECT
+          (SELECT AVG(xg) FROM \`${bqTable("xg_match_data")}\` WHERE season_id = @seasonId) AS avg_xg,
+          (
+            SELECT AVG(score) FROM (
+              SELECT home_score AS score FROM \`${bqTable("matches")}\`
+                WHERE season_id = @seasonId AND status = 'finished' AND home_score IS NOT NULL
+              UNION ALL
+              SELECT away_score AS score FROM \`${bqTable("matches")}\`
+                WHERE season_id = @seasonId AND status = 'finished' AND away_score IS NOT NULL
+            )
+          ) AS avg_goals
       `,
       params: { seasonId },
       types: { seasonId: "STRING" }
@@ -332,8 +406,13 @@ export async function backtest({ seasonId, log }) {
 
   const matches = matchesRows[0];
   const timeline = buildTeamTimeline(xgRows[0]);
-  const baselineAvg = Number(baselineRows[0]?.[0]?.avg_xg);
-  const baseline = Number.isFinite(baselineAvg) && baselineAvg > 0 ? baselineAvg : 1.45;
+  const avgXg = Number(baselineRows[0]?.[0]?.avg_xg);
+  const avgGoals = Number(baselineRows[0]?.[0]?.avg_goals);
+  const baseline = {
+    avgGoalsForPerMatch: Number.isFinite(avgXg) && avgXg > 0 ? avgXg : 1.45,
+    avgXgPerMatch: Number.isFinite(avgXg) && avgXg > 0 ? avgXg : 1.45,
+    avgActualGoalsPerMatch: Number.isFinite(avgGoals) && avgGoals > 0 ? avgGoals : 1.5
+  };
 
   let logLossSum = 0;
   let brierSum = 0;
@@ -346,30 +425,30 @@ export async function backtest({ seasonId, log }) {
     away: { count: 0, predictedProb: 0 }
   };
 
+  const homeDefenseFactor = 1 / params.homeAttackFactor;
+
   for (const m of matches) {
-    const homeForm = formFromTimeline(timeline, m.home_team_id, m.kickoff_at);
-    const awayForm = formFromTimeline(timeline, m.away_team_id, m.kickoff_at);
+    const homeForm = formFromTimeline(timeline, m.home_team_id, m.kickoff_at, params);
+    const awayForm = formFromTimeline(timeline, m.away_team_id, m.kickoff_at, params);
 
     if (homeForm.matchesUsed === 0 || awayForm.matchesUsed === 0) {
       skipped += 1;
       continue;
     }
 
-    const homeAttack = strengthRatio(homeForm.xgPerMatch, baseline);
-    const homeDefense = strengthRatio(homeForm.xgaPerMatch, baseline);
-    const awayAttack = strengthRatio(awayForm.xgPerMatch, baseline);
-    const awayDefense = strengthRatio(awayForm.xgaPerMatch, baseline);
+    const homeS = computeBlendedStrengths(homeForm, baseline, params.xgGoalsBlend);
+    const awayS = computeBlendedStrengths(awayForm, baseline, params.xgGoalsBlend);
 
     const lambdaHome = Math.max(
-      MIN_LAMBDA,
-      baseline * homeAttack * awayDefense * HOME_ATTACK_FACTOR
+      params.minLambda,
+      baseline.avgGoalsForPerMatch * homeS.attack * awayS.defense * params.homeAttackFactor
     );
     const lambdaAway = Math.max(
-      MIN_LAMBDA,
-      baseline * awayAttack * homeDefense * HOME_DEFENSE_FACTOR
+      params.minLambda,
+      baseline.avgGoalsForPerMatch * awayS.attack * homeS.defense * homeDefenseFactor
     );
 
-    const outcome = matchOutcomeProbabilities(lambdaHome, lambdaAway);
+    const outcome = matchOutcomeProbabilities(lambdaHome, lambdaAway, { rho: params.rho });
 
     const homeScore = Number(m.home_score);
     const awayScore = Number(m.away_score);
@@ -408,61 +487,90 @@ export async function backtest({ seasonId, log }) {
     o.averagePredictedProbWhenActual = o.count > 0 ? o.predictedProb / o.count : 0;
   }
 
-  log?.info({ seasonId, scored, skipped }, "Backtest completed");
+  log?.info({ seasonId, scored, skipped, params }, "Backtest completed");
 
   return {
     seasonId,
     modelVersion: MODEL_VERSION,
+    params,
     matchesScored: scored,
     matchesSkipped: skipped,
     accuracyTop1: scored > 0 ? correctTop1 / scored : 0,
     logLoss: scored > 0 ? logLossSum / scored : 0,
     brierScore: scored > 0 ? brierSum / scored : 0,
-    baselineAvgXg: baseline,
+    baseline,
     perOutcome
   };
 }
 
 function buildTeamTimeline(xgRows) {
-  // teamId -> array of { kickoffMs, xg, xga } sorted ascending by kickoff.
+  // teamId -> [{ kickoffMs, xg, xga, goalsFor, goalsAgainst }, ...] sorted ASC
   const map = new Map();
   for (const r of xgRows) {
     const kickoffMs = toEpochMs(r.kickoff_at);
     if (kickoffMs === null) continue;
     const teamId = r.team_id;
+    const isHome = !!r.is_home;
+    const goalsFor = isHome ? Number(r.home_score) : Number(r.away_score);
+    const goalsAgainst = isHome ? Number(r.away_score) : Number(r.home_score);
     if (!map.has(teamId)) map.set(teamId, []);
-    map.get(teamId).push({ kickoffMs, xg: Number(r.xg), xga: Number(r.xga ?? 0) });
+    map.get(teamId).push({
+      kickoffMs,
+      xg: Number(r.xg),
+      xga: Number(r.xga ?? 0),
+      goalsFor,
+      goalsAgainst
+    });
   }
   return map;
 }
 
-function formFromTimeline(timeline, teamId, beforeKickoff) {
+function formFromTimeline(timeline, teamId, beforeKickoff, params) {
   const entries = timeline.get(teamId);
-  if (!entries) return { xgPerMatch: null, xgaPerMatch: null, matchesUsed: 0 };
+  const empty = {
+    xgPerMatch: null,
+    xgaPerMatch: null,
+    goalsForPerMatch: null,
+    goalsAgainstPerMatch: null,
+    matchesUsed: 0
+  };
+  if (!entries) return empty;
   const beforeMs = toEpochMs(beforeKickoff);
-  if (beforeMs === null) return { xgPerMatch: null, xgaPerMatch: null, matchesUsed: 0 };
+  if (beforeMs === null) return empty;
 
-  // Pick the last FORM_WINDOW entries strictly before this kickoff.
+  // Walk back through history; collect up to formWindow entries strictly
+  // before this kickoff. Most-recent first so index 0 carries the highest
+  // decay weight.
   const filtered = [];
-  for (let i = entries.length - 1; i >= 0 && filtered.length < FORM_WINDOW; i -= 1) {
+  for (let i = entries.length - 1; i >= 0 && filtered.length < params.formWindow; i -= 1) {
     if (entries[i].kickoffMs < beforeMs) filtered.push(entries[i]);
   }
-  if (filtered.length === 0) {
-    return { xgPerMatch: null, xgaPerMatch: null, matchesUsed: 0 };
-  }
-  const xgSum = filtered.reduce((s, e) => s + e.xg, 0);
-  const xgaSum = filtered.reduce((s, e) => s + e.xga, 0);
+  if (filtered.length === 0) return empty;
+
+  let weightSum = 0;
+  let xgWeighted = 0;
+  let xgaWeighted = 0;
+  let goalsForWeighted = 0;
+  let goalsAgainstWeighted = 0;
+  filtered.forEach((e, idx) => {
+    const w = params.decayRate > 0 ? Math.exp(-params.decayRate * idx) : 1;
+    weightSum += w;
+    xgWeighted += w * e.xg;
+    xgaWeighted += w * e.xga;
+    goalsForWeighted += w * e.goalsFor;
+    goalsAgainstWeighted += w * e.goalsAgainst;
+  });
   return {
-    xgPerMatch: xgSum / filtered.length,
-    xgaPerMatch: xgaSum / filtered.length,
+    xgPerMatch: xgWeighted / weightSum,
+    xgaPerMatch: xgaWeighted / weightSum,
+    goalsForPerMatch: goalsForWeighted / weightSum,
+    goalsAgainstPerMatch: goalsAgainstWeighted / weightSum,
     matchesUsed: filtered.length
   };
 }
 
 function toEpochMs(bqTimestamp) {
   if (!bqTimestamp) return null;
-  // BigQuery returns timestamps either as a JS Date, an ISO string, or
-  // as { value: "..." }. Handle all three.
   if (bqTimestamp instanceof Date) return bqTimestamp.getTime();
   if (typeof bqTimestamp === "string") return Date.parse(bqTimestamp);
   if (typeof bqTimestamp === "object" && bqTimestamp.value) {

@@ -27,7 +27,19 @@ const backtestBodySchema = {
   type: "object",
   required: ["seasonId"],
   properties: {
-    seasonId: { type: "string", pattern: "^\\d{4}/\\d{4}$" }
+    seasonId: { type: "string", pattern: "^\\d{4}/\\d{4}$" },
+    paramOverrides: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        formWindow: { type: "integer", minimum: 1, maximum: 50 },
+        decayRate: { type: "number", minimum: 0, maximum: 1 },
+        rho: { type: "number", minimum: -0.5, maximum: 0.5 },
+        xgGoalsBlend: { type: "number", minimum: 0, maximum: 1 },
+        homeAttackFactor: { type: "number", minimum: 0.5, maximum: 2 },
+        minLambda: { type: "number", minimum: 0, maximum: 1 }
+      }
+    }
   }
 };
 
@@ -108,7 +120,11 @@ export const postBacktestController = {
   schema: { body: backtestBodySchema },
   handler: async (request, reply) => {
     try {
-      const report = await backtest({ seasonId: request.body.seasonId, log: request.log });
+      const report = await backtest({
+        seasonId: request.body.seasonId,
+        paramOverrides: request.body.paramOverrides,
+        log: request.log
+      });
       return setGeneralResponse(reply, 200, "Success", "Backtest completed", report);
     } catch (error) {
       return handleErrorResponse(reply, error, request);

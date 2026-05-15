@@ -42,4 +42,20 @@ describe("matchOutcomeProbabilities", () => {
     expect(r.expectedHomeGoals).toBe(1.7);
     expect(r.expectedAwayGoals).toBe(0.9);
   });
+
+  it("Dixon-Coles rho > 0 increases draw probability vs baseline", () => {
+    const base = matchOutcomeProbabilities(1.4, 1.1, { rho: 0 });
+    const dc = matchOutcomeProbabilities(1.4, 1.1, { rho: 0.1 });
+    expect(dc.probDraw).toBeGreaterThan(base.probDraw);
+    // and the trio still sums to 1
+    expect(dc.probHomeWin + dc.probDraw + dc.probAwayWin).toBeCloseTo(1, 6);
+  });
+
+  it("rho == 0 is identical to the baseline", () => {
+    const base = matchOutcomeProbabilities(1.6, 1.1);
+    const dc = matchOutcomeProbabilities(1.6, 1.1, { rho: 0 });
+    expect(dc.probHomeWin).toBeCloseTo(base.probHomeWin, 8);
+    expect(dc.probDraw).toBeCloseTo(base.probDraw, 8);
+    expect(dc.probAwayWin).toBeCloseTo(base.probAwayWin, 8);
+  });
 });
