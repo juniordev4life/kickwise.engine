@@ -75,7 +75,7 @@ describe("projection scoreOne", () => {
     expect(out.breakdown.startingProbability).toBeLessThan(1);
   });
 
-  it("multiplier sits in the [0.7, 1.3] band", () => {
+  it("multiplier sits in the [0.3, 1.5] band", () => {
     const players = [
       { position: "GK", teamId: "7", averagePoints: 100, startingProbability: 1 },
       { position: "DEF", teamId: "7", averagePoints: 100, startingProbability: 1 },
@@ -84,8 +84,23 @@ describe("projection scoreOne", () => {
     ];
     for (const p of players) {
       const out = scoreOneForTest(p, PREDICTION_DRAW_ODDS, true);
-      expect(out.breakdown.multiplier).toBeGreaterThanOrEqual(0.7);
-      expect(out.breakdown.multiplier).toBeLessThanOrEqual(1.3);
+      expect(out.breakdown.multiplier).toBeGreaterThanOrEqual(0.3);
+      expect(out.breakdown.multiplier).toBeLessThanOrEqual(1.5);
     }
+  });
+
+  it("applies the underdog penalty when win + clean-sheet both very low", () => {
+    const heavyUnderdog = {
+      probHomeWin: 0.78,
+      probDraw: 0.15,
+      probAwayWin: 0.07,
+      expectedHomeGoals: 2.8,
+      expectedAwayGoals: 0.5
+    };
+    const awayDef = { position: "DEF", teamId: "91", averagePoints: 100, startingProbability: 1 };
+    const out = scoreOneForTest(awayDef, heavyUnderdog, false);
+    expect(out.breakdown.isUnderdog).toBe(true);
+    // Penalty pulls the multiplier well below 0.5
+    expect(out.breakdown.multiplier).toBeLessThan(0.5);
   });
 });

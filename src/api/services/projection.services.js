@@ -19,11 +19,22 @@ const POSITION_WEIGHTS = {
 
 // The "situational multiplier" maps situational_factor ∈ [0, 1] into the
 // observed Kickbase point variance range. Empirically a player on a great
-// matchday (clean sheet + win + scoring) puts up ~+50% over their average;
-// in a 0-3 loss they sit ~-30%. Centering at 1.0 when factor=0.5 keeps the
-// projection unbiased on a 50/50 fixture.
-const MULTIPLIER_MIN = 0.7;
-const MULTIPLIER_RANGE = 0.6;
+// matchday (clean sheet + win + scoring) puts up ~+80% over their average;
+// in a 0-4 blowout he sits ~30-50% of average — much wider than the v1
+// band suggested. The current values reflect what users would have called
+// out as "too generous to losing-side players": Hamburg DEFs at 78% of avg
+// when prediction says Leverkusen 4:0.
+const MULTIPLIER_MIN = 0.3;
+const MULTIPLIER_RANGE = 1.2;
+
+// Hard underdog floor: when the predicted match is a clear blowout against
+// this player's team (low win prob, low clean-sheet prob), apply an extra
+// multiplier to push Kickbase-style negative point swings (conceded goals,
+// no bonus). Triggered for the bottom ~10% of fixtures by predicted
+// outcome.
+const UNDERDOG_WIN_THRESHOLD = 0.15;
+const UNDERDOG_CLEAN_SHEET_THRESHOLD = 0.1;
+const UNDERDOG_PENALTY = 0.6;
 
 // Attack normalization: a team expected to score 2.5 goals = "max attack
 // situational signal". Anything beyond is clipped (otherwise a 3-goal
@@ -107,7 +118,14 @@ function scoreOne(player, prediction, isHome) {
   const situational =
     weights.cleanSheet * cleanSheetProb + weights.win * teamWinProb + weights.attack * attackFactor;
 
-  const multiplier = MULTIPLIER_MIN + MULTIPLIER_RANGE * situational;
+  let multiplier = MULTIPLIER_MIN + MULTIPLIER_RANGE * situational;
+  // Hard underdog floor — pull the multiplier down further when the team
+  // is a clear underdog (low win prob) AND will likely concede (low CS).
+  const isUnderdog =
+    teamWinProb < UNDERDOG_WIN_THRESHOLD && cleanSheetProb < UNDERDOG_CLEAN_SHEET_THRESHOLD;
+  if (isUnderdog) {
+    multiplier *= UNDERDOG_PENALTY;
+  }
   const baseAvg = Number(player.averagePoints);
   const startingProb =
     player.startingProbability !== null && player.startingProbability !== undefined
@@ -131,6 +149,7 @@ function scoreOne(player, prediction, isHome) {
       opponentExpectedGoals,
       situationalFactor: situational,
       multiplier,
+      isUnderdog,
       isHome
     }
   };
