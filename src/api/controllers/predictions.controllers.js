@@ -5,6 +5,7 @@ import {
   computePrediction,
   findUpcomingMatchday
 } from "../services/prediction.services.js";
+import { projectPlayersForMatch } from "../services/projection.services.js";
 
 const matchParamsSchema = {
   type: "object",
@@ -106,6 +107,49 @@ export const postRefreshCurrentController = {
         refreshed: true,
         ...summary
       });
+    } catch (error) {
+      return handleErrorResponse(reply, error, request);
+    }
+  }
+};
+
+const projectionBodySchema = {
+  type: "object",
+  required: ["players"],
+  properties: {
+    players: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["teamId", "position"],
+        properties: {
+          playerId: { type: ["string", "number", "null"] },
+          teamId: { type: ["string", "number"] },
+          position: { type: "string" },
+          averagePoints: { type: ["number", "null"] },
+          startingProbability: { type: ["number", "null"] }
+        }
+      }
+    }
+  }
+};
+
+/**
+ * POST /api/v1/projections/match/:matchId — given a fixture and a list of
+ * players, return their expected Kickbase points for that match.
+ */
+export const postMatchProjectionsController = {
+  schema: {
+    params: matchParamsSchema,
+    body: projectionBodySchema
+  },
+  handler: async (request, reply) => {
+    try {
+      const result = await projectPlayersForMatch({
+        matchId: request.params.matchId,
+        players: request.body.players
+      });
+      return setGeneralResponse(reply, 200, "Success", "Projections computed", result);
     } catch (error) {
       return handleErrorResponse(reply, error, request);
     }
